@@ -10,6 +10,7 @@ from typing import Any, List
 
 import zmq
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     ListLorasReq,
@@ -202,6 +203,10 @@ class Scheduler:
                         prompt="",
                         is_warmup=True,
                     )
+
+                # if envs.SGLANG_CACHE_DIT_ENABLED:
+                #     req.extra["cache_dit_num_inference_steps"] = 4
+                #     req.num_inference_steps = 4
 
                 self.waiting_queue.append((None, req))
             # if server is warmed-up, set this flag to avoid req-based warmup

@@ -55,6 +55,10 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
+    # Qwen-Image-Edit SP behavior
+    SGLANG_QWEN_IMAGE_EDIT_SP_SHARD_CONDITION_LATENTS: bool = False
+    # Ulysses/SP communication behavior
+    SGLANG_USP_ASYNC_ALLTOALL: bool = False
 
 
 def get_default_cache_root() -> str:
@@ -178,6 +182,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_RINGBUFFER_WARNING_INTERVAL": _lazy_int(
         "SGLANG_DIFFUSION_RINGBUFFER_WARNING_INTERVAL", 60
     ),
+    # If enabled, shard Qwen-Image-Edit condition image latents (input image tokens)
+    # across SP ranks, instead of replicating them on every rank.
+    # This makes the total image token sequence closer to a full 1/SP split.
+    "SGLANG_QWEN_IMAGE_EDIT_SP_SHARD_CONDITION_LATENTS": _lazy_bool(
+        "SGLANG_QWEN_IMAGE_EDIT_SP_SHARD_CONDITION_LATENTS", "false"
+    ),
+    # If enabled, use async all-to-all for Ulysses SP and overlap the three Q/K/V
+    # collectives by launching them in parallel and waiting later.
+    "SGLANG_USP_ASYNC_ALLTOALL": _lazy_bool("SGLANG_USP_ASYNC_ALLTOALL", "false"),
     # Path to the NCCL library file. It is needed because nccl>=2.19 brought
     # by PyTorch contains a bug: https://github.com/NVIDIA/nccl/issues/1234
     "SGLANG_DIFFUSION_NCCL_SO_PATH": _lazy_str("SGLANG_DIFFUSION_NCCL_SO_PATH"),

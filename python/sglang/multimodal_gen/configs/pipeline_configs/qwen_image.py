@@ -18,6 +18,11 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     maybe_unpad_latents,
     shard_rotary_emb_for_sp,
 )
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_parallel_rank,
+    get_sp_world_size,
+    sequence_model_parallel_all_gather,
+)
 from sglang.multimodal_gen.runtime.models.vision_utils import resize
 from sglang.multimodal_gen.utils import calculate_dimensions
 
@@ -207,6 +212,47 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
             batch, batch.negative_prompt_embeds, rotary_emb, device, dtype
         )
 
+    def gather_latents_for_sp(self, latents):
+        """
+        Qwen-Image uses packed *image* latents: [B, S, D]. If SP is enabled for image
+        models, gather along sequence dim=1. Keep the base behavior for video-like 5D.
+        """
+        if latents is None:
+            return latents
+        if latents.dim() == 3:
+            return sequence_model_parallel_all_gather(latents, dim=1)
+        return super().gather_latents_for_sp(latents)
+
+    def _shard_seq_dim1_for_sp(self, x: torch.Tensor) -> torch.Tensor:
+        """Shard a [B, S, ...] tensor along S (dim=1) across SP ranks."""
+        sp_world_size, rank_in_sp = get_sp_world_size(), get_sp_parallel_rank()
+        if sp_world_size <= 1:
+            return x
+        seq_len = x.shape[1]
+        if seq_len % sp_world_size != 0:
+            pad_len = sp_world_size - (seq_len % sp_world_size)
+            pad_shape = list(x.shape)
+            pad_shape[1] = pad_len
+            pad = x.new_zeros(pad_shape)
+            x = torch.cat([x, pad], dim=1)
+            seq_len = x.shape[1]
+        local_len = seq_len // sp_world_size
+        start = rank_in_sp * local_len
+        end = start + local_len
+        return x[:, start:end, ...]
+
+    def shard_latents_for_sp(self, batch, latents):
+        """
+        Shard latents for SP.
+        - For packed Qwen-Image image latents: [B, S, D] shard on S.
+        - Fallback to base behavior for 5D video-like latents.
+        """
+        if get_sp_world_size() <= 1:
+            return latents, False
+        if latents is not None and isinstance(latents, torch.Tensor) and latents.dim() == 3:
+            return self._shard_seq_dim1_for_sp(latents), True
+        return super().shard_latents_for_sp(batch, latents)
+
     def post_denoising_loop(self, latents, batch):
         # unpack latents for qwen-image
         (
@@ -265,13 +311,34 @@ class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
 
         img_cache, txt_cache = freqs_cis
         noisy_img_cache = shard_rotary_emb_for_sp(img_cache[:noisy_img_seq_len, :])
-        img_cache = torch.cat(
-            [noisy_img_cache, img_cache[noisy_img_seq_len:, :]], dim=0
-        ).to(device=device)
+        cond_img_cache = img_cache[noisy_img_seq_len:, :]
+        # Optionally shard condition image tokens too (default keeps them replicated)
+        import sglang.multimodal_gen.envs as envs
+
+        if envs.SGLANG_QWEN_IMAGE_EDIT_SP_SHARD_CONDITION_LATENTS:
+            cond_img_cache = shard_rotary_emb_for_sp(cond_img_cache)
+        img_cache = torch.cat([noisy_img_cache, cond_img_cache], dim=0).to(device=device)
         return {
             "txt_seq_lens": txt_seq_lens,
             "freqs_cis": (img_cache, txt_cache),
         }
+
+    def shard_latents_for_sp(self, batch, latents):
+        # Shard packed noisy latents [B, S_noisy, D]
+        latents, did = super().shard_latents_for_sp(batch, latents)
+
+        # Optionally shard condition image latents too (input image tokens)
+        import sglang.multimodal_gen.envs as envs
+
+        if (
+            envs.SGLANG_QWEN_IMAGE_EDIT_SP_SHARD_CONDITION_LATENTS
+            and getattr(batch, "image_latent", None) is not None
+            and isinstance(batch.image_latent, torch.Tensor)
+            and batch.image_latent.dim() == 3
+            and get_sp_world_size() > 1
+        ):
+            batch.image_latent = self._shard_seq_dim1_for_sp(batch.image_latent)
+        return latents, did
 
     def preprocess_condition_image(
         self, image, target_width, target_height, _vae_image_processor
@@ -448,9 +515,12 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
         if isinstance(freqs_cis[0], torch.Tensor) and freqs_cis[0].dim() == 2:
             img_cache, txt_cache = freqs_cis
             noisy_img_cache = shard_rotary_emb_for_sp(img_cache[:noisy_img_seq_len, :])
-            img_cache = torch.cat(
-                [noisy_img_cache, img_cache[noisy_img_seq_len:, :]], dim=0
-            ).to(device=device)
+            cond_img_cache = img_cache[noisy_img_seq_len:, :]
+            import sglang.multimodal_gen.envs as envs
+
+            if envs.SGLANG_QWEN_IMAGE_EDIT_SP_SHARD_CONDITION_LATENTS:
+                cond_img_cache = shard_rotary_emb_for_sp(cond_img_cache)
+            img_cache = torch.cat([noisy_img_cache, cond_img_cache], dim=0).to(device=device)
             return {
                 "txt_seq_lens": txt_seq_lens,
                 "freqs_cis": (img_cache, txt_cache),
@@ -461,13 +531,17 @@ class QwenImageEditPlusPipelineConfig(QwenImageEditPipelineConfig):
         noisy_img_cos = shard_rotary_emb_for_sp(img_cos[:noisy_img_seq_len, :])
         noisy_img_sin = shard_rotary_emb_for_sp(img_sin[:noisy_img_seq_len, :])
 
-        # concat back the img_cos for input image (since it is not sp-shared later)
-        img_cos = torch.cat([noisy_img_cos, img_cos[noisy_img_seq_len:, :]], dim=0).to(
-            device=device
-        )
-        img_sin = torch.cat([noisy_img_sin, img_sin[noisy_img_seq_len:, :]], dim=0).to(
-            device=device
-        )
+        # concat back caches for condition image tokens
+        import sglang.multimodal_gen.envs as envs
+
+        cond_img_cos = img_cos[noisy_img_seq_len:, :]
+        cond_img_sin = img_sin[noisy_img_seq_len:, :]
+        if envs.SGLANG_QWEN_IMAGE_EDIT_SP_SHARD_CONDITION_LATENTS:
+            cond_img_cos = shard_rotary_emb_for_sp(cond_img_cos)
+            cond_img_sin = shard_rotary_emb_for_sp(cond_img_sin)
+
+        img_cos = torch.cat([noisy_img_cos, cond_img_cos], dim=0).to(device=device)
+        img_sin = torch.cat([noisy_img_sin, cond_img_sin], dim=0).to(device=device)
 
         return {
             "txt_seq_lens": txt_seq_lens,

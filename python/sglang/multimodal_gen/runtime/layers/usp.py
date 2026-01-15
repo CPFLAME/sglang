@@ -46,6 +46,26 @@ def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+def _usp_all_to_all_single_async(x: torch.Tensor):
+    """
+    Async variant of all_to_all_single.
+    Returns a callable `wait()` that produces the shaped tensor.
+    """
+    ulysses_pg = get_sp_group().ulysses_group
+    assert ulysses_pg is not None, "Ulysses process group is not initialized."
+    x_shape = x.shape
+    x_flat = x.flatten()
+    y = ft_c.all_to_all_single(
+        x_flat, output_split_sizes=None, input_split_sizes=None, group=ulysses_pg
+    )
+
+    def wait():
+        y_waited = _maybe_wait(y)
+        return y_waited.reshape(x_shape)
+
+    return wait
+
+
 def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     """
     Perform Ulysses-style input all-to-all over the head dimension.
@@ -104,6 +124,78 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     return x_c.permute(tuple(new_order)).contiguous()
 
 
+def _usp_input_all_to_all_async(x: torch.Tensor, head_dim: int = 1):
+    """
+    Async variant of _usp_input_all_to_all. Returns a callable `wait()` producing the output tensor.
+    """
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return lambda: x
+
+    assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
+    assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
+    seq_dim = 1 if head_dim == 2 else 2
+
+    # Bring to canonical [b, h, s, d]
+    if head_dim == 1 and seq_dim == 2:
+        x_c = x
+    else:
+        x_c = x.permute(0, head_dim, seq_dim, 3).contiguous()
+
+    b, h, _s, d = x_c.shape
+    assert (
+        h % world_size == 0
+    ), f"h ({h}) must be divisible by world_size ({world_size})"
+
+    # [b, h, s_local, d] -> [h, b, s_local, d]
+    x_c = x_c.permute(1, 0, 2, 3).contiguous()
+    wait_a2a = _usp_all_to_all_single_async(x_c)
+
+    def wait():
+        x_w = wait_a2a()
+        # -> [b, h_local, s, d]
+        x_out = (
+            x_w.reshape(world_size, h // world_size, b, -1, d)
+            .permute(2, 1, 0, 3, 4)
+            .reshape(b, h // world_size, -1, d)
+        )
+        if head_dim == 1 and seq_dim == 2:
+            return x_out
+        new_order = [0, None, None, 3]
+        new_order[head_dim] = 1
+        new_order[seq_dim] = 2
+        return x_out.permute(tuple(new_order)).contiguous()
+
+    return wait
+
+
+def _usp_input_all_to_all_qkv_async(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, head_dim: int = 1
+):
+    """
+    Fused async Ulysses input all-to-all for Q/K/V.
+
+    Instead of launching 3 separate all-to-all collectives, we pack QKV on the
+    batch dimension and do a single collective:
+      q,k,v: [B, S_local, H, D]  -> pack -> [3*B, S_local, H, D]
+      then run one _usp_input_all_to_all_async, and unpack back.
+
+    Returns a callable wait() -> (q_out, k_out, v_out) with outputs shaped like:
+      [B, S_global, H_local, D]
+    """
+    assert q.shape == k.shape == v.shape, "q/k/v must have identical shapes"
+    b = q.shape[0]
+    x = torch.cat([q, k, v], dim=0)  # [3B, S_local, H, D]
+    wait_a2a = _usp_input_all_to_all_async(x, head_dim=head_dim)
+
+    def wait():
+        x_out = wait_a2a()  # [3B, S_global, H_local, D]
+        q_out, k_out, v_out = x_out[:b], x_out[b : 2 * b], x_out[2 * b : 3 * b]
+        return q_out, k_out, v_out
+
+    return wait
+
+
 def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     """
     Perform Ulysses-style output all-to-all over the head dimension (inverse of input).
@@ -159,6 +251,51 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     new_order[head_dim] = 1
     new_order[seq_dim] = 2
     return x_c.permute(tuple(new_order)).contiguous()
+
+
+def _usp_output_all_to_all_async(x: torch.Tensor, head_dim: int = 1):
+    """
+    Async variant of _usp_output_all_to_all. Returns a callable `wait()` producing the output tensor.
+    """
+    world_size = get_ulysses_parallel_world_size()
+    if world_size <= 1:
+        return lambda: x
+
+    assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
+    assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
+    seq_dim = 1 if head_dim == 2 else 2
+
+    # Bring to canonical [b, h, s, d]
+    if head_dim == 1 and seq_dim == 2:
+        x_c = x
+    else:
+        x_c = x.permute(0, head_dim, seq_dim, 3).contiguous()
+
+    b, h, s, d = x_c.shape
+    assert (
+        s % world_size == 0
+    ), f"s ({s}) must be divisible by world_size ({world_size})"
+
+    # [b, h_local, s, d] -> [s, b, h_local, d]
+    x_c = x_c.permute(2, 0, 1, 3).contiguous()
+    wait_a2a = _usp_all_to_all_single_async(x_c)
+
+    def wait():
+        x_w = wait_a2a()
+        # -> [b, h, s_local, d]
+        x_out = (
+            x_w.reshape(world_size, s // world_size, b, -1, d)
+            .permute(2, 0, 3, 1, 4)
+            .reshape(b, -1, s // world_size, d)
+        )
+        if head_dim == 1 and seq_dim == 2:
+            return x_out
+        new_order = [0, None, None, 3]
+        new_order[head_dim] = 1
+        new_order[seq_dim] = 2
+        return x_out.permute(tuple(new_order)).contiguous()
+
+    return wait
 
 
 def ring_attn(

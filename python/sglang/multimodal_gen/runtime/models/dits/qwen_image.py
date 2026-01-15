@@ -15,14 +15,18 @@ from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 
 from sglang.multimodal_gen.configs.models.dits.qwenimage import QwenImageDitConfig
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device, get_tp_world_size
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     LayerNorm,
     RMSNorm,
     apply_qk_norm,
 )
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
@@ -475,37 +479,61 @@ class QwenImageCrossAttention(nn.Module):
         self.parallel_attention = parallel_attention
         self.added_kv_proj_dim = added_kv_proj_dim
 
+        tp_size = get_tp_world_size()
+        assert (
+            num_heads % tp_size == 0
+        ), f"num_heads {num_heads} must be divisible by tp world size {tp_size}"
+        self.local_num_heads = num_heads // tp_size
+
         # Use separate Q/K/V projections
         self.inner_dim = out_dim if out_dim is not None else head_dim * num_heads
         self.inner_kv_dim = self.inner_dim
-        self.to_q = ReplicatedLinear(dim, self.inner_dim, bias=True)
-        self.to_k = ReplicatedLinear(dim, self.inner_dim, bias=True)
-        self.to_v = ReplicatedLinear(dim, self.inner_dim, bias=True)
+        # self.to_q = ReplicatedLinear(dim, self.inner_dim, bias=True)
+        # self.to_k = ReplicatedLinear(dim, self.inner_dim, bias=True)
+        # self.to_v = ReplicatedLinear(dim, self.inner_dim, bias=True)
+        self.to_q = ColumnParallelLinear(dim, self.inner_dim, bias=True, gather_output=False)
+        self.to_k = ColumnParallelLinear(dim, self.inner_dim, bias=True, gather_output=False)
+        self.to_v = ColumnParallelLinear(dim, self.inner_dim, bias=True, gather_output=False)
 
         if self.qk_norm:
             self.norm_q = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
             self.norm_k = RMSNorm(head_dim, eps=eps) if qk_norm else nn.Identity()
 
         if added_kv_proj_dim is not None:
-            self.add_q_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim, bias=True
+            # self.add_q_proj = ReplicatedLinear(
+            #     added_kv_proj_dim, self.inner_dim, bias=True
+            # )
+            # self.add_k_proj = ReplicatedLinear(
+            #     added_kv_proj_dim, self.inner_dim, bias=True
+            # )
+            # self.add_v_proj = ReplicatedLinear(
+            #     added_kv_proj_dim, self.inner_dim, bias=True
+            # )
+            self.add_q_proj = ColumnParallelLinear(
+                added_kv_proj_dim, self.inner_dim, bias=True, gather_output=False,
             )
-            self.add_k_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim, bias=True
+            self.add_k_proj = ColumnParallelLinear(
+                added_kv_proj_dim, self.inner_dim, bias=True, gather_output=False,
             )
-            self.add_v_proj = ReplicatedLinear(
-                added_kv_proj_dim, self.inner_dim, bias=True
+            self.add_v_proj = ColumnParallelLinear(
+                added_kv_proj_dim, self.inner_dim, bias=True, gather_output=False,
             )
 
         if context_pre_only is not None and not context_pre_only:
-            self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
+            # self.to_add_out = ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
+            self.to_add_out = RowParallelLinear(
+                self.inner_dim, self.dim, bias=out_bias, input_is_parallel=True,
+            )
         else:
             self.to_add_out = None
 
         if not pre_only:
             self.to_out = nn.ModuleList([])
             self.to_out.append(
-                ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
+                # ReplicatedLinear(self.inner_dim, self.dim, bias=out_bias)
+                RowParallelLinear(
+                    self.inner_dim, self.dim, bias=out_bias, input_is_parallel=True,
+                )
             )
         else:
             self.to_out = None
@@ -515,7 +543,7 @@ class QwenImageCrossAttention(nn.Module):
 
         # Scaled dot product attention
         self.attn = USPAttention(
-            num_heads=num_heads,
+            num_heads=self.local_num_heads,
             head_size=self.head_dim,
             dropout_rate=0,
             softmax_scale=None,
@@ -543,13 +571,13 @@ class QwenImageCrossAttention(nn.Module):
         )
 
         # Reshape for multi-head attention
-        img_query = img_query.unflatten(-1, (self.num_heads, -1))
-        img_key = img_key.unflatten(-1, (self.num_heads, -1))
-        img_value = img_value.unflatten(-1, (self.num_heads, -1))
+        img_query = img_query.unflatten(-1, (self.local_num_heads, -1))
+        img_key = img_key.unflatten(-1, (self.local_num_heads, -1))
+        img_value = img_value.unflatten(-1, (self.local_num_heads, -1))
 
-        txt_query = txt_query.unflatten(-1, (self.num_heads, -1))
-        txt_key = txt_key.unflatten(-1, (self.num_heads, -1))
-        txt_value = txt_value.unflatten(-1, (self.num_heads, -1))
+        txt_query = txt_query.unflatten(-1, (self.local_num_heads, -1))
+        txt_key = txt_key.unflatten(-1, (self.local_num_heads, -1))
+        txt_value = txt_value.unflatten(-1, (self.local_num_heads, -1))
 
         # Apply QK normalization
         if self.qk_norm:
@@ -592,6 +620,10 @@ class QwenImageCrossAttention(nn.Module):
         joint_query = torch.cat([txt_query, img_query], dim=1)
         joint_key = torch.cat([txt_key, img_key], dim=1)
         joint_value = torch.cat([txt_value, img_value], dim=1)
+
+        # print(f"joint_query shape: {joint_query.shape}")
+        # print(f"joint_key shape: {joint_key.shape}")
+        # print(f"joint_value shape: {joint_value.shape}")
 
         # Compute joint attention
         joint_hidden_states = self.attn(
@@ -730,6 +762,7 @@ class QwenImageTransformerBlock(nn.Module):
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         modulate_index: Optional[List[int]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # print(f"hidden_states shape: {hidden_states.shape}")
         # Get modulation parameters for both streams
         img_mod_params = self.img_mod[1](temb_img_silu)  # [B, 6*dim]
         txt_mod_params = self.txt_mod[1](temb_txt_silu)  # [B, 6*dim]

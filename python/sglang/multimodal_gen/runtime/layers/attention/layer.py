@@ -23,7 +23,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.usp import (
     _usp_input_all_to_all,
+    _usp_input_all_to_all_async,
+    _usp_input_all_to_all_qkv_async,
     _usp_output_all_to_all,
+    _usp_output_all_to_all_async,
     ring_attn,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
@@ -366,10 +369,17 @@ class USPAttention(nn.Module):
 
         # Ulysses-style All-to-All for sequence/head sharding
         if get_ulysses_parallel_world_size() > 1:
-            # -> [B, S, H_local, D]
-            q = _usp_input_all_to_all(q, head_dim=2)
-            k = _usp_input_all_to_all(k, head_dim=2)
-            v = _usp_input_all_to_all(v, head_dim=2)
+            import sglang.multimodal_gen.envs as envs
+
+            if envs.SGLANG_USP_ASYNC_ALLTOALL:
+                # Fused QKV all-to-all: one collective instead of three.
+                qkv_wait = _usp_input_all_to_all_qkv_async(q, k, v, head_dim=2)
+                q, k, v = qkv_wait()
+            else:
+                # -> [B, S, H_local, D]
+                q = _usp_input_all_to_all(q, head_dim=2)
+                k = _usp_input_all_to_all(k, head_dim=2)
+                v = _usp_input_all_to_all(v, head_dim=2)
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:
@@ -387,7 +397,13 @@ class USPAttention(nn.Module):
 
         # Ulysses-style All-to-All to restore original sharding
         if get_ulysses_parallel_world_size() > 1:
-            # -> [B, S_local, H, D]
-            out = _usp_output_all_to_all(out, head_dim=2)
+            import sglang.multimodal_gen.envs as envs
+
+            if envs.SGLANG_USP_ASYNC_ALLTOALL:
+                out_wait = _usp_output_all_to_all_async(out, head_dim=2)
+                out = out_wait()
+            else:
+                # -> [B, S_local, H, D]
+                out = _usp_output_all_to_all(out, head_dim=2)
 
         return out
