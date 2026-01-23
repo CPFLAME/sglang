@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import get_attn_backend
 from sglang.multimodal_gen.runtime.layers.usp import (
+    _usp_all_to_all_single_async,
     _usp_input_all_to_all,
     _usp_input_all_to_all_async,
     _usp_input_all_to_all_qkv_async,
@@ -367,10 +368,16 @@ class USPAttention(nn.Module):
             out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
             return out
 
+        # Experimental: head-parallel Ulysses mode (similar to LightX2V enable_head_parallel).
+        # We keep this outside torch.compile to avoid graph-break surprises and make it easy
+        # to benchmark behavior deterministically.
+        import sglang.multimodal_gen.envs as envs
+
+        if envs.SGLANG_USP_HEAD_PARALLEL and get_ulysses_parallel_world_size() > 1:
+            return self._forward_head_parallel(q, k, v, ctx_attn_metadata)
+
         # Ulysses-style All-to-All for sequence/head sharding
         if get_ulysses_parallel_world_size() > 1:
-            import sglang.multimodal_gen.envs as envs
-
             if envs.SGLANG_USP_ASYNC_ALLTOALL:
                 # Fused QKV all-to-all: one collective instead of three.
                 qkv_wait = _usp_input_all_to_all_qkv_async(q, k, v, head_dim=2)
@@ -397,8 +404,6 @@ class USPAttention(nn.Module):
 
         # Ulysses-style All-to-All to restore original sharding
         if get_ulysses_parallel_world_size() > 1:
-            import sglang.multimodal_gen.envs as envs
-
             if envs.SGLANG_USP_ASYNC_ALLTOALL:
                 out_wait = _usp_output_all_to_all_async(out, head_dim=2)
                 out = out_wait()
@@ -407,3 +412,124 @@ class USPAttention(nn.Module):
                 out = _usp_output_all_to_all(out, head_dim=2)
 
         return out
+
+    def forward_with_ulysses_sharded_qkv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Forward when Q/K/V have already been Ulysses input-all-to-all'd.
+
+        Expected input layout:
+            q,k,v: [B, S_global, H_local, D]
+        Returns:
+            out:   [B, S_local, H, D] (restored via output all-to-all)
+        """
+        forward_context: ForwardContext = get_forward_context()
+        ctx_attn_metadata = forward_context.attn_metadata
+
+        # Ring Attention within subgroups or local attention
+        if get_ring_parallel_world_size() > 1:
+            out = ring_attn(
+                q,
+                k,
+                v,
+                attn_impl=self.attn_impl,
+                is_causal=self.causal,
+                dropout_p=self.dropout_p,
+            )
+        else:
+            out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+
+        # Restore original sharding: [B, S_local, H, D]
+        if get_ulysses_parallel_world_size() > 1:
+            out = _usp_output_all_to_all(out, head_dim=2)
+        return out
+
+    def _forward_head_parallel(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        ctx_attn_metadata,
+    ) -> torch.Tensor:
+        """
+        Head-parallel USP path.
+
+        Input:  q,k,v: [B, S_local, H, D] (H divisible by ulysses_world_size)
+        Output:         [B, S_local, H, D]
+        """
+        # Use Python ints as much as possible so torch.compile can unroll the
+        # head loop when head count is fixed.
+        world_size = int(get_ulysses_parallel_world_size())
+        if world_size <= 1:
+            return self.attn_impl.forward(q, k, v, ctx_attn_metadata)
+
+        assert q.shape == k.shape == v.shape
+        b, s_local, _h, d = q.shape
+        h = int(self.num_heads)
+        assert (
+            q.shape[2] == h
+        ), f"Unexpected head dim: q.shape[2]={q.shape[2]} vs self.num_heads={h}"
+        assert h % world_size == 0, (
+            f"num_heads ({h}) must be divisible by ulysses_world_size ({world_size})"
+        )
+        shard_heads = h // world_size
+        s_global = s_local * world_size
+
+        # Reshape heads into (world_size, shard_heads) so that we can all-to-all per shard_head.
+        # [B, S_local, H, D] -> [shard_heads, world_size, B, S_local, D]
+        def _prep(x: torch.Tensor) -> torch.Tensor:
+            x = x.contiguous().view(b, s_local, world_size, shard_heads, d)
+            return x.permute(3, 2, 0, 1, 4).contiguous()
+
+        q_p = _prep(q)
+        k_p = _prep(k)
+        v_p = _prep(v)
+
+        # Launch async comm for all local heads first, then compute head-by-head
+        # while later comms are in flight.
+        q_waits = []
+        k_waits = []
+        v_waits = []
+        for hi in range(shard_heads):
+            q_waits.append(_usp_all_to_all_single_async(q_p[hi]))
+            k_waits.append(_usp_all_to_all_single_async(k_p[hi]))
+            v_waits.append(_usp_all_to_all_single_async(v_p[hi]))
+
+        out_full = q.new_empty((b, s_local, h, d))
+
+        def _post_comm(x_wbsd: torch.Tensor) -> torch.Tensor:
+            # [world_size, B, S_local, D] -> [B, S_global, 1, D]
+            x = x_wbsd.permute(1, 0, 2, 3).contiguous().reshape(b, s_global, d)
+            return x.unsqueeze(2)
+
+        for hi in range(shard_heads):
+            q_r = _post_comm(q_waits[hi]())
+            k_r = _post_comm(k_waits[hi]())
+            v_r = _post_comm(v_waits[hi]())
+
+            # Attention on a single local head.
+            if get_ring_parallel_world_size() > 1:
+                out_hi = ring_attn(
+                    q_r,
+                    k_r,
+                    v_r,
+                    attn_impl=self.attn_impl,
+                    is_causal=self.causal,
+                    dropout_p=self.dropout_p,
+                )
+            else:
+                out_hi = self.attn_impl.forward(q_r, k_r, v_r, ctx_attn_metadata)
+
+            # Restore original sharding for this head-group:
+            # [B, S_global, 1, D] -> [B, S_local, world_size, D]
+            out_back = _usp_output_all_to_all(out_hi, head_dim=2)
+
+            # Place into output head dimension. This corresponds to original head indices:
+            # hi*world_size : (hi+1)*world_size.
+            out_full[:, :, hi * world_size : (hi + 1) * world_size, :] = out_back
+
+        return out_full

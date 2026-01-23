@@ -30,6 +30,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
+from sglang.multimodal_gen.runtime.layers.usp import _usp_input_all_to_all_async
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_gate_select01_kernel,
     fuse_scale_shift_kernel,
@@ -40,6 +41,16 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiT
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
+
+
+_QWEN_USP_COMM_STREAM: torch.cuda.Stream | None = None
+
+
+def _get_qwen_usp_comm_stream() -> torch.cuda.Stream:
+    global _QWEN_USP_COMM_STREAM
+    if _QWEN_USP_COMM_STREAM is None:
+        _QWEN_USP_COMM_STREAM = torch.cuda.Stream()
+    return _QWEN_USP_COMM_STREAM
 
 
 def _get_qkv_projections(
@@ -566,18 +577,60 @@ class QwenImageCrossAttention(nn.Module):
     ):
         seq_len_txt = encoder_hidden_states.shape[1]
 
-        img_query, img_key, img_value, txt_query, txt_key, txt_value = (
-            _get_qkv_projections(self, hidden_states, encoder_hidden_states)
+        import sglang.multimodal_gen.envs as envs
+        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+            get_ulysses_parallel_world_size,
         )
+
+        # Experimental: overlap QKV GEMM with Ulysses A2A by starting Q's A2A early on a
+        # dedicated CUDA stream.
+        use_overlap = (
+            envs.SGLANG_QWEN_IMAGE_QKV_A2A_OVERLAP
+            and hidden_states.is_cuda
+            and (get_ulysses_parallel_world_size() > 1)
+        )
+
+        if not use_overlap:
+            img_query, img_key, img_value, txt_query, txt_key, txt_value = (
+                _get_qkv_projections(self, hidden_states, encoder_hidden_states)
+            )
+        else:
+            # Minimal marker to confirm which overlap variant is active in profiles/logs.
+            # We keep this extremely light to avoid perturbing performance results.
+            try:
+                import torch.cuda.nvtx as nvtx
+
+                nvtx.range_push("qwen_image_overlap:qk_pack")
+                nvtx.range_pop()
+            except Exception:
+                pass
+            # -------------------------------
+            # Overlap schedule (Qwen-Image, QK-pack variant):
+            #   1) Compute Q and K (img+txt) on default stream, apply fused qk_norm + RoPE
+            #   2) Launch a single A2A(QK_packed) on comm stream
+            #   3) Compute V (img+txt) GEMM on default stream while A2A(QK) is in flight
+            #   4) Launch A2A(V) on comm stream, then join and run attention with ulysses-sharded QKV
+            #
+            # This variant avoids dummy tensors and keeps fused apply_qk_norm/rope semantics.
+            # -------------------------------
+            img_query, _ = self.to_q(hidden_states)
+            img_key, _ = self.to_k(hidden_states)
+            txt_query, _ = self.add_q_proj(encoder_hidden_states)
+            txt_key, _ = self.add_k_proj(encoder_hidden_states)
 
         # Reshape for multi-head attention
         img_query = img_query.unflatten(-1, (self.local_num_heads, -1))
-        img_key = img_key.unflatten(-1, (self.local_num_heads, -1))
-        img_value = img_value.unflatten(-1, (self.local_num_heads, -1))
-
         txt_query = txt_query.unflatten(-1, (self.local_num_heads, -1))
-        txt_key = txt_key.unflatten(-1, (self.local_num_heads, -1))
-        txt_value = txt_value.unflatten(-1, (self.local_num_heads, -1))
+
+        if not use_overlap:
+            img_key = img_key.unflatten(-1, (self.local_num_heads, -1))
+            img_value = img_value.unflatten(-1, (self.local_num_heads, -1))
+
+            txt_key = txt_key.unflatten(-1, (self.local_num_heads, -1))
+            txt_value = txt_value.unflatten(-1, (self.local_num_heads, -1))
+        else:
+            img_key = img_key.unflatten(-1, (self.local_num_heads, -1))
+            txt_key = txt_key.unflatten(-1, (self.local_num_heads, -1))
 
         # Apply QK normalization
         if self.qk_norm:
@@ -619,18 +672,64 @@ class QwenImageCrossAttention(nn.Module):
         # Order: [text, image]
         joint_query = torch.cat([txt_query, img_query], dim=1)
         joint_key = torch.cat([txt_key, img_key], dim=1)
-        joint_value = torch.cat([txt_value, img_value], dim=1)
+        if not use_overlap:
+            joint_value = torch.cat([txt_value, img_value], dim=1)
+        else:
+            joint_value = None
 
         # print(f"joint_query shape: {joint_query.shape}")
         # print(f"joint_key shape: {joint_key.shape}")
         # print(f"joint_value shape: {joint_value.shape}")
 
         # Compute joint attention
-        joint_hidden_states = self.attn(
-            joint_query,
-            joint_key,
-            joint_value,
-        )
+        if not use_overlap:
+            joint_hidden_states = self.attn(
+                joint_query,
+                joint_key,
+                joint_value,
+            )
+        else:
+            comm_stream = _get_qwen_usp_comm_stream()
+            qk_event = torch.cuda.Event()
+            v_event = torch.cuda.Event()
+
+            joint_query = joint_query.contiguous()
+            joint_key = joint_key.contiguous()
+
+            # Launch A2A(QK_packed) first.
+            qk_packed = torch.cat([joint_query, joint_key], dim=0).contiguous()
+            qk_event.record()  # on default stream
+            with torch.cuda.stream(comm_stream):
+                comm_stream.wait_event(qk_event)
+                qk_wait = _usp_input_all_to_all_async(qk_packed, head_dim=2)
+
+            # Compute V projections on default stream while QK A2A is running.
+            img_value, _ = self.to_v(hidden_states)
+            txt_value, _ = self.add_v_proj(encoder_hidden_states)
+            img_value = img_value.unflatten(-1, (self.local_num_heads, -1))
+            txt_value = txt_value.unflatten(-1, (self.local_num_heads, -1))
+            joint_value = torch.cat([txt_value, img_value], dim=1).contiguous()
+
+            # Launch A2A(V)
+            v_event.record()
+            with torch.cuda.stream(comm_stream):
+                comm_stream.wait_event(v_event)
+                v_wait = _usp_input_all_to_all_async(joint_value, head_dim=2)
+
+            # Materialize on comm stream and signal completion back to default stream.
+            done_event = torch.cuda.Event()
+            with torch.cuda.stream(comm_stream):
+                qk_g = qk_wait()
+                v_g = v_wait()
+                bsz = v_g.shape[0]
+                q_g = qk_g[:bsz]
+                k_g = qk_g[bsz:]
+                done_event.record()
+
+            torch.cuda.current_stream().wait_event(done_event)
+            joint_hidden_states = self.attn.forward_with_ulysses_sharded_qkv(
+                q_g, k_g, v_g
+            )
 
         # Reshape back
         joint_hidden_states = joint_hidden_states.flatten(2, 3)

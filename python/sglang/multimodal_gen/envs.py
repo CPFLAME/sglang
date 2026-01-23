@@ -59,6 +59,24 @@ if TYPE_CHECKING:
     SGLANG_QWEN_IMAGE_EDIT_SP_SHARD_CONDITION_LATENTS: bool = False
     # Ulysses/SP communication behavior
     SGLANG_USP_ASYNC_ALLTOALL: bool = False
+    # Experimental: Ulysses head-parallel mode.
+    # This mimics a "per-head" pipeline: async all-to-all per local head, then
+    # compute attention head-by-head, and finally all-to-all to restore.
+    # Default disabled.
+    SGLANG_USP_HEAD_PARALLEL: bool = False
+    # Experimental: overlap QKV projections with Ulysses all-to-all in Qwen-Image DiT.
+    # The idea is: compute Q first -> start A2A(Q) on a dedicated CUDA stream while
+    # computing K/V GEMMs on the default stream.
+    SGLANG_QWEN_IMAGE_QKV_A2A_OVERLAP: bool = False
+    # Experimental: use FP8 compression for USP/Ulysses all-to-all payloads.
+    # This reduces communication bandwidth at the cost of quant/dequant overhead
+    # and potential numerical error. Default disabled.
+    SGLANG_USP_FP8_COMM: bool = False
+    # Experimental: when using SGLANG_USP_FP8_COMM, use LightX2V's vLLM-based
+    # per-token FP8 quantizer (vLLM scaled_fp8_quant) instead of sgl-kernel.
+    # This is mainly for A/B testing to isolate quantizer differences.
+    #
+    SGLANG_USP_FP8_COMM_USE_VLLM: bool = False
 
 
 def get_default_cache_root() -> str:
@@ -191,6 +209,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If enabled, use async all-to-all for Ulysses SP and overlap the three Q/K/V
     # collectives by launching them in parallel and waiting later.
     "SGLANG_USP_ASYNC_ALLTOALL": _lazy_bool("SGLANG_USP_ASYNC_ALLTOALL", "false"),
+    # If enabled, use head-parallel mode for Ulysses SP (experimental).
+    "SGLANG_USP_HEAD_PARALLEL": _lazy_bool("SGLANG_USP_HEAD_PARALLEL", "false"),
+    # If enabled, overlap QKV GEMM with Ulysses A2A (Qwen-Image specific, experimental).
+    "SGLANG_QWEN_IMAGE_QKV_A2A_OVERLAP": _lazy_bool(
+        "SGLANG_QWEN_IMAGE_QKV_A2A_OVERLAP", "false"
+    ),
+    # If enabled, quantize the all-to-all payload to FP8 and send FP8 + scales.
+    # Experimental and may hurt numerics depending on model/workload.
+    "SGLANG_USP_FP8_COMM": _lazy_bool("SGLANG_USP_FP8_COMM", "false"),
+    # If enabled, use vLLM's scaled_fp8_quant for the USP FP8 path.
+    "SGLANG_USP_FP8_COMM_USE_VLLM": _lazy_bool("SGLANG_USP_FP8_COMM_USE_VLLM", "false"),
     # Path to the NCCL library file. It is needed because nccl>=2.19 brought
     # by PyTorch contains a bug: https://github.com/NVIDIA/nccl/issues/1234
     "SGLANG_DIFFUSION_NCCL_SO_PATH": _lazy_str("SGLANG_DIFFUSION_NCCL_SO_PATH"),
